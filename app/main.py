@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from ics import Calendar, Event
 import aiofiles
 import isodate 
+import pytz
 app = FastAPI(title="Schedule to ICS API")
 
 # Logging setup
@@ -78,6 +79,7 @@ async def upload_schedule(
 
     # -------------------- Process schedule --------------------
     cal = Calendar()
+    tz = pytz.timezone("Europe/Warsaw")
     n_rows = sheet.nrows()
     n_cols = sheet.ncols()
     logger.info(f"Processing sheet: {n_rows} rows x {n_cols} cols")
@@ -102,8 +104,13 @@ async def upload_schedule(
                             end_raw = sheet[row_idx + 3, c].value
 
                             try:
-                                start_dt = f"{year}-{month:02d}-{day:02d} {iso_to_hms(start_raw)}"
-                                end_dt = f"{year}-{month:02d}-{day:02d} {iso_to_hms(end_raw)}"
+                                start_hms = iso_to_hms(start_raw)
+                                end_hms = iso_to_hms(end_raw)
+
+                                from datetime import datetime
+                                start_dt = tz.localize(datetime.strptime(f"{year}-{month:02d}-{day:02d} {start_hms}", "%Y-%m-%d %H:%M:%S"))
+                                end_dt = tz.localize(datetime.strptime(f"{year}-{month:02d}-{day:02d} {end_hms}", "%Y-%m-%d %H:%M:%S"))
+
                                 if start_dt == end_dt:
                                     c += 1
                                     continue
