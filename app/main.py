@@ -1,18 +1,35 @@
+import os
+import re
+import ezodf
+import tempfile
+import logging
+from datetime import datetime, timedelta
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
-import pandas as pd
 from ics import Calendar, Event
-from datetime import datetime
-import io
-import pyexcel
-import os
-import logging
-
+import aiofiles
+import isodate 
 app = FastAPI(title="Schedule to ICS API")
 
-# Set up logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def iso_to_hms(iso_duration):
+    # Parse the ISO 8601 duration string
+    duration = isodate.parse_duration(iso_duration)
+    # Convert the duration to total seconds
+    total_seconds = int(duration.total_seconds())
+    # Format as HH:MM:SS
+    return f"{total_seconds // 3600:02}:{(total_seconds % 3600) // 60:02}:{total_seconds % 60:02}"
+
+
+def is_valid_time(time_str: str) -> bool:
+    """Validate if a time string matches HH:MM or HH:MM:SS format and has valid hours."""
+    pattern = r'^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$'
+    return bool(re.match(pattern, time_str))
+
 
 @app.post("/upload-schedule")
 async def upload_schedule(
@@ -21,107 +38,105 @@ async def upload_schedule(
     year: int = Form(...)
 ):
     logger.info("Request received for /upload-schedule")
-    # === Read the uploaded file into a BytesIO buffer ===
-    logger.info("Starting file read")
-    file.file.seek(0)
-    file_bytes = file.file.read()
-    logger.info(f"File read complete, size: {len(file_bytes)} bytes")
 
-    # Determine file type and read with appropriate engine
     filename = file.filename.lower()
-    
-    try:
-        if filename.endswith(".ods"):
-            logger.info("Processing ODS file")
-            book_data = pyexcel.get_book_dict(file_content=file_bytes, file_type="ods")
-            if "Plan" not in book_data:
-                logger.error("Sheet 'Plan' not found in ODS file")
-                return JSONResponse(status_code=400, content={"error": "Sheet 'Plan' not found in ODS file."})
-            sheet_data = book_data["Plan"]
-            df = pd.DataFrame(sheet_data).astype(str).fillna("")
-        elif filename.endswith((".xlsx", ".xls")):
-            logger.info("Processing Excel file")
-            buffer = io.BytesIO(file_bytes)
-            df = pd.read_excel(buffer, engine="openpyxl", header=None, sheet_name="Plan", dtype=str)
-            df = df.fillna("")
-        else:
-            logger.error("Unsupported file type")
-            return JSONResponse(status_code=400, content={"error": "Unsupported file type. Use .ods or .xlsx"})
-        logger.info(f"DataFrame created: {df.shape[0]} rows, {df.shape[1]} columns")
-    except Exception as e:
-        logger.error(f"Failed to read file: {e}")
-        return JSONResponse(status_code=500, content={"error": f"Failed to read file: {e}"})
+    if not filename.endswith(".ods"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Unsupported file type. Only .ods files are accepted."}
+        )
 
-    # === Generate ICS calendar ===
+    # Save the uploaded file to disk
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ods", delete=False) as tmp:
+            tmp_path = tmp.name
+        async with aiofiles.open(tmp_path, "wb") as out_file:
+            while chunk := await file.read(1024 * 1024):
+                await out_file.write(chunk)
+        logger.info(f"File saved to {tmp_path}")
+    except Exception as e:
+        logger.error(f"Failed to save uploaded ODS file: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    # Open ODS directly with ezodf
+    try:
+        doc = ezodf.opendoc(tmp_path)
+        sheet = next((s for s in doc.sheets if s.name.lower() == "plan"), None)
+        if not sheet:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Sheet 'Plan' not found in ODS file"}
+            )
+    except Exception as e:
+        logger.error(f"Failed to open ODS: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception as cleanup_err:
+            logger.warning(f"Failed to remove temp file: {cleanup_err}")
+
+    # -------------------- Process schedule --------------------
     cal = Calendar()
-    rows, cols = df.shape
+    n_rows = sheet.nrows()
+    n_cols = sheet.ncols()
+    logger.info(f"Processing sheet: {n_rows} rows x {n_cols} cols")
+    for row_idx in range(n_rows):
+        for col_idx in range(n_cols):
+            val = sheet[row_idx, col_idx].value
+            if isinstance(val, str) and val.strip().lower() == "diana":
+                
+                # Check that next row has 'dzień'
+                if row_idx + 1 < n_rows:
+                    next_val = sheet[row_idx + 1, col_idx].value
+                    if isinstance(next_val, str) and next_val.strip().lower() == "dzień":
+                        c = col_idx + 1
+                        while c < n_cols:
+                            day_val = sheet[row_idx + 1, c].value
+                            if not isinstance(day_val, float):
+                                c += 1
+                                continue
 
-    for row in range(rows):
-        for col in range(cols):
-            cell_value = df.iat[row, col].strip()
-            if cell_value.lower() == "diana":
-                if row + 1 < rows and df.iat[row + 1, col].strip().lower() == "dzień":
-                    c = col + 1
-                    while c < cols:
-                        val = df.iat[row + 1, c].strip()
-                        if not val:
-                            c += 1
-                            continue
-                        try:
-                            day = int(val)
-                        except ValueError:
-                            c += 1
-                            continue
-                        if 1 <= day <= 31:
-                            start_raw = df.iat[row + 2, c].strip() if row + 2 < rows else ""
-                            end_raw = df.iat[row + 3, c].strip() if row + 3 < rows else ""
-                            if start_raw and end_raw:
-                                try:
-                                    start_dt = datetime.strptime(f"{year}-{month:02d}-{day:02d} {start_raw}", "%Y-%m-%d %H:%M:%S")
-                                    if end_raw == "24:00":
-                                        end_dt_base = datetime(year, month, day) + pd.Timedelta(days=1)
-                                        end_dt = end_dt_base.replace(hour=0, minute=0)
-                                    else:
-                                        end_dt = datetime.strptime(f"{year}-{month:02d}-{day:02d} {end_raw}", "%Y-%m-%d %H:%M:%S")
-                                    if end_dt <= start_dt:
-                                        end_dt += pd.Timedelta(days=1)
-                                    event = Event(
-                                        name="Работа",
-                                        begin=start_dt,
-                                        end=end_dt
-                                    )
-                                    cal.events.add(event)
-                                except Exception as e:
-                                    print(f"⛔ Error processing day {day} (Times: '{start_raw}' -> '{end_raw}'): {e}")
-                        c += 1
+                            day = int(day_val)
+                            start_raw = sheet[row_idx + 2, c].value
+                            end_raw = sheet[row_idx + 3, c].value
 
-    # === Return ICS file ===
-    logger.info("Generating ICS content")
+                            try:
+                                start_dt = f"{year}-{month:02d}-{day:02d} {iso_to_hms(start_raw)}"
+                                end_dt = f"{year}-{month:02d}-{day:02d} {iso_to_hms(end_raw)}"
+                                if start_dt == end_dt:
+                                    c += 1
+                                    continue
+                                cal.events.add(Event(name="Работа", begin=start_dt, end=end_dt))
+                                logger.info(f"Added event for day {day}: {start_dt} → {end_dt}")
+                            except Exception as e:
+                                    logger.error(f"Error adding event for day {day}: {e}")
+
+                            c += 1
+
+    if not cal.events:
+        return JSONResponse(status_code=400, content={"error": "No valid events found in schedule."})
+
+    # -------------------- Write and return ICS --------------------
     ics_content = cal.serialize()
-    # Save ICS content to a persistent file on the system with a unique name
-    output_path = f"work_schedule_{year}{month:02d}_{int(datetime.now().timestamp())}.ics"
     try:
-        logger.info(f"Writing ICS file to {output_path}")
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(ics_content)
-        logger.info(f"ICS file successfully written to {output_path}")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ics", delete=False, encoding="utf-8") as tmp_ics:
+            ics_path = tmp_ics.name
+            tmp_ics.write(ics_content)
+            tmp_ics.flush()
+        logger.info(f"ICS file created at {ics_path}")
     except Exception as e:
-        logger.error(f"Failed to write ICS file to {output_path}: {e}")
         return JSONResponse(status_code=500, content={"error": f"Failed to write ICS file: {e}"})
 
-    # Ensure file exists before sending
-    if not os.path.exists(output_path):
-        logger.error(f"ICS file not found at {output_path}")
-        return JSONResponse(status_code=500, content={"error": "Failed to create ICS file on server."})
-
-    logger.info(f"Sending ICS file: {output_path}")
     return FileResponse(
-        path=output_path,
+        path=ics_path,
         filename="work_schedule.ics",
         media_type="text/calendar",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "close",
-            "Content-Disposition": f"attachment; filename=work_schedule.ics"
-        }
+            "Content-Disposition": "attachment; filename=work_schedule.ics"
+        },
     )
+
