@@ -19,7 +19,7 @@ services:
     networks:
       - fastapi_network
     ports:
-      - "80:80"
+      - "81:81"
 
 networks:
   fastapi_network:
