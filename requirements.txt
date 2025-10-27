@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+lxml
+ezodf
+ics
+aiofiles
+isodate
+python-multipart

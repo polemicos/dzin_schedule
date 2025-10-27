@@ -3,7 +3,6 @@ import re
 import ezodf
 import tempfile
 import logging
-from datetime import datetime, timedelta
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from ics import Calendar, Event
